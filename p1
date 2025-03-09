@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+// Importing OpenZeppelin contracts for security and functionality
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title ProfessionalToken
+ * @dev ERC-20 token with staking and reward mechanisms
+ */
+contract ProfessionalToken is ERC20, Ownable, Pausable, ReentrancyGuard {
+    // Constants for staking configuration
+    uint256 public constant MINIMUM_STAKE_AMOUNT = 100 * 10**18; // Minimum staking amount (100 tokens)
+    uint256 public constant MINIMUM_STAKE_DURATION = 7 days; // Minimum staking period (7 days)
+    uint256 public constant REWARD_RATE = 5; // 5% annual reward rate (scaled by 100)
+
+    // Total amount of tokens currently staked in the contract
+    uint256 public totalStaked;
+
+    // Structure to store staking information for each user
+    struct Stake {
+        uint256 amount;              // Staked token amount
+        uint256 startTime;           // Timestamp when staking started
+        uint256 lastRewardCalculation; // Last time rewards were calculated
+        uint256 accumulatedRewards;  // Total accumulated rewards
+    }
+
+    // Mapping to track staking information of each user
+    mapping(address => Stake) public stakes;
+
+    // Events to log important contract actions
+    event TokensBurned(address indexed burner, uint256 amount);
+    event Staked(address indexed staker, uint256 amount);
+    event Unstaked(address indexed staker, uint256 amount, uint256 rewards);
+    event RewardClaimed(address indexed staker, uint256 rewards);
+
+    /**
+     * @dev Contract constructor, initializes the token with a name, symbol, and initial supply
+     */
+    constructor() ERC20("ProfessionalToken", "PRO") Ownable(msg.sender) {
+        _mint(msg.sender, 1_000_000 * 10**18); // Mint 1M tokens to the contract deployer
+    }
+
+    /**
+     * @dev Burns tokens from the sender's balance
+     * @param amount The number of tokens to burn
+     */
+    function burn(uint256 amount) external whenNotPaused {
+        require(amount > 0, "Amount must be greater than 0");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+
+        _burn(msg.sender, amount);
+        emit TokensBurned(msg.sender, amount);
+    }
+
+    /**
+     * @dev Allows a user to stake tokens and earn rewards
+     * @param amount The number of tokens to stake
+     */
+    function stake(uint256 amount) external whenNotPaused nonReentrant {
+        require(amount >= MINIMUM_STAKE_AMOUNT, "Amount below minimum stake requirement");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+
+        // Update rewards if the user has an existing stake
+        if (stakes[msg.sender].amount > 0) {
+            _updateRewards(msg.sender);
+        } else {
+            stakes[msg.sender].lastRewardCalculation = block.timestamp;
+        }
+
+        // Transfer tokens from the staker to the contract
+        _transfer(msg.sender, address(this), amount);
+
+        // Update staking data
+        stakes[msg.sender].amount += amount;
+        if (stakes[msg.sender].startTime == 0) {
+            stakes[msg.sender].startTime = block.timestamp;
+        }
+        totalStaked += amount;
+
+        emit Staked(msg.sender, amount);
+    }
+
+    /**
+     * @dev Allows a user to unstake tokens and claim accumulated rewards
+     * @param amount The number of tokens to unstake
+     */
+    function unstake(uint256 amount) external whenNotPaused nonReentrant {
+        require(stakes[msg.sender].amount >= amount, "Insufficient staked amount");
+        require(
+            block.timestamp >= stakes[msg.sender].startTime + MINIMUM_STAKE_DURATION,
+            "Minimum staking period not met"
+        );
+
+        // Update staking rewards before withdrawing
+        _updateRewards(msg.sender);
+        uint256 rewards = stakes[msg.sender].accumulatedRewards;
+        stakes[msg.sender].accumulatedRewards = 0;
+
+        // Update staking data
+        stakes[msg.sender].amount -= amount;
+        totalStaked -= amount;
+
+        // Transfer staked tokens back to the user
+        _transfer(address(this), msg.sender, amount);
+
+        // Mint rewards if available
+        if (rewards > 0) {
+            _mint(msg.sender, rewards);
+        }
+
+        emit Unstaked(msg.sender, amount, rewards);
+
+        // Reset start time if the user fully unstakes
+        if (stakes[msg.sender].amount == 0) {
+            stakes[msg.sender].startTime = 0;
+        }
+    }
+
+    /**
+     * @dev Allows a user to claim staking rewards without unstaking
+     */
+    function claimRewards() external whenNotPaused nonReentrant {
+        _updateRewards(msg.sender);
+        uint256 rewards = stakes[msg.sender].accumulatedRewards;
+        require(rewards > 0, "No rewards to claim");
+
+        // Reset accumulated rewards and mint them to the user
+        stakes[msg.sender].accumulatedRewards = 0;
+        _mint(msg.sender, rewards);
+
+        emit RewardClaimed(msg.sender, rewards);
+    }
+
+    /**
+     * @dev Returns the current staking rewards of a user
+     * @param staker Address of the user
+     * @return The amount of rewards available
+     */
+    function getStakingRewards(address staker) external view returns (uint256) {
+        if (stakes[staker].amount == 0) {
+            return stakes[staker].accumulatedRewards;
+        }
+
+        uint256 timeElapsed = block.timestamp - stakes[staker].lastRewardCalculation;
+        uint256 newRewards = (stakes[staker].amount * REWARD_RATE * timeElapsed) / (365 days * 100);
+        return stakes[staker].accumulatedRewards + newRewards;
+    }
+
+    /**
+     * @dev Updates the staking rewards for a specific user
+     * @param staker Address of the user
+     */
+    function _updateRewards(address staker) internal {
+        uint256 timeElapsed = block.timestamp - stakes[staker].lastRewardCalculation;
+        if (timeElapsed > 0 && stakes[staker].amount > 0) {
+            // Reward calculation formula: (amount * rate * time) / (year in seconds * 100)
+            uint256 newRewards = (stakes[staker].amount * REWARD_RATE * timeElapsed) / (365 days * 100);
+            stakes[staker].accumulatedRewards += newRewards;
+            stakes[staker].lastRewardCalculation = block.timestamp;
+        }
+    }
+
+    /**
+     * @dev Allows the contract owner to pause token transfers and staking operations
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Allows the contract owner to unpause token transfers and staking operations
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+}
